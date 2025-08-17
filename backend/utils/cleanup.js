@@ -1,13 +1,11 @@
 require('dotenv').config();
 const fs = require('fs');
-const path = require('path');
-const moment = require('moment');
 const mongoose = require('mongoose');
 const connectDB = require('../config/db');
-const File = require('../models/file');
+const File = require('../models/File');
 
 (async () => {
-  await connectDB(process.env.MONGO_URI);
+  await connectDB(process.env.MONGODB_URI); // ✅ fixed variable name
 
   const now = new Date();
   const expired = await File.find({ expiryTime: { $lte: now } });
@@ -16,11 +14,12 @@ const File = require('../models/file');
     try {
       if (fs.existsSync(file.filePath)) fs.unlinkSync(file.filePath);
     } catch (e) {
-      console.warn('Could not delete file:', file.filePath, e.message);
+      console.warn('⚠️ Could not delete file:', file.filePath, e.message);
     }
   }
 
   await File.deleteMany({ expiryTime: { $lte: now } });
   console.log(`🧹 Cleanup complete: removed ${expired.length} expired file(s)`);
+
   await mongoose.disconnect();
 })();

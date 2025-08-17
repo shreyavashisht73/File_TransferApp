@@ -4,84 +4,89 @@ const { v4: uuidv4 } = require('uuid');
 const moment = require('moment');
 const path = require('path');
 const fs = require('fs');
-const File = require('../models/file');
-const { sendDownloadLink } = require('../utils/mailer');
+const File = require('../models/File');
+const { sendDownloadLink, sendFileToSender } = require('../utils/mailer');
 
 const router = express.Router();
 
-/** Multer storage & filters */
+/** Ensure uploads folder exists */
+const uploadDir = path.join(__dirname, '..', 'uploads');
+if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+
+/** Multer storage config */
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const dir = path.join(__dirname, '..', 'uploads');
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir);
-    cb(null, dir);
-  },
-  filename: (req, file, cb) => {
-    const unique = `${uuidv4()}${path.extname(file.originalname)}`;
-    cb(null, unique);
-  }
+  destination: (req, file, cb) => cb(null, uploadDir),
+  filename: (req, file, cb) => cb(null, uuidv4() + path.extname(file.originalname)),
 });
+const upload = multer({ storage });
 
-const upload = multer({
-  storage,
-  limits: { fileSize: 1024 * 1024 * 1024 }, // 1 GB
-  fileFilter: (req, file, cb) => {
-    // Allow most common types; extend as needed
-    cb(null, true);
-  }
-});
-
-/** POST /api/files/upload */
+/** POST /api/files/upload -> upload file */
 router.post('/upload', upload.single('file'), async (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
+    if (!req.file) return res.status(400).json({ message: ' No file uploaded' });
 
     const expiryHours = Number(process.env.LINK_EXPIRY_HOURS || 24);
     const expiryTime = moment().add(expiryHours, 'hours').toDate();
-    const id = uuidv4();
 
     const doc = await File.create({
-      uuid: id,
+      uuid: uuidv4(),
       originalName: req.file.originalname,
       storedName: req.file.filename,
       mimeType: req.file.mimetype,
       sizeBytes: req.file.size,
       filePath: req.file.path,
       expiryTime,
-      senderEmail: req.body.senderEmail || '',
-      receiverEmail: req.body.receiverEmail || ''
+      senderEmail: req.body.senderEmail?.trim() || '',
+      receiverEmail: req.body.receiverEmail?.trim() || '',
     });
 
     const base = process.env.BASE_URL || `${req.protocol}://${req.get('host')}`;
-    const downloadPage = `${base}/api/files/${doc.uuid}/info`;   // metadata endpoint
-    const directDownload = `${base}/api/files/${doc.uuid}/download`;
+    const infoPage = `${base}/api/files/${doc.uuid}/info`;
+    const viewLink = `${base}/api/files/${doc.uuid}/view`;
+    const downloadLink = `${base}/api/files/${doc.uuid}/download`;
 
-    // Optional email
+    //  Confirmation email to sender
+    if (doc.senderEmail) {
+      try {
+        await sendFileToSender({
+          to: doc.senderEmail,
+          link: viewLink, 
+          originalName: doc.originalName,
+          expiryHours,
+        });
+      } catch (e) {
+        console.error(" Failed to send confirmation email:", e.message);
+      }
+    }
+
+    // 📥 Download link email to receiver
     if (doc.receiverEmail) {
-      await sendDownloadLink({
-        to: doc.receiverEmail,
-        link: directDownload,
-        originalName: doc.originalName,
-        expiryHours
-      });
+      try {
+        await sendDownloadLink({
+          to: doc.receiverEmail,
+          link: viewLink, 
+          originalName: doc.originalName,
+          expiryHours,
+        });
+      } catch (e) {
+        console.error(" Failed to send download link:", e.message);
+      }
     }
 
     res.json({
       uuid: doc.uuid,
       originalName: doc.originalName,
       expiresAt: doc.expiryTime,
-      links: {
-        info: downloadPage,
-        download: directDownload
-      }
+      links: { info: infoPage, view: viewLink, download: downloadLink },
+      message: ' File uploaded successfully!',
     });
   } catch (err) {
-    console.error(err);
+    console.error(" Upload error:", err);
     res.status(500).json({ message: 'Upload failed' });
   }
 });
 
-/** GET /api/files/:uuid/info -> metadata (for frontend countdown) */
+/** GET /api/files/:uuid/info -> file metadata */
 router.get('/:uuid/info', async (req, res) => {
   const file = await File.findOne({ uuid: req.params.uuid });
   if (!file) return res.status(404).json({ message: 'Not found' });
@@ -94,17 +99,36 @@ router.get('/:uuid/info', async (req, res) => {
     mimeType: file.mimeType,
     expiresAt: file.expiryTime,
     expired,
-    downloadCount: file.downloadCount
+    downloadCount: file.downloadCount,
   });
 });
 
-/** GET /api/files/:uuid/download -> triggers actual download */
+/** GET /api/files/:uuid/view -> open in browser */
+router.get('/:uuid/view', async (req, res) => {
+  const file = await File.findOne({ uuid: req.params.uuid });
+  if (!file) return res.status(404).json({ message: 'Not found' });
+
+  if (new Date() > file.expiryTime) {
+    try { if (fs.existsSync(file.filePath)) fs.unlinkSync(file.filePath); } catch {}
+    await file.deleteOne();
+    return res.status(410).json({ message: 'Link expired' });
+  }
+
+  file.downloadCount += 1;
+  await file.save();
+
+  //  Make sure browser tries to render
+  res.setHeader("Content-Type", file.mimeType);
+  res.setHeader("Content-Disposition", `inline; filename="${file.originalName}"`);
+  res.sendFile(path.resolve(file.filePath));
+});
+
+/** GET /api/files/:uuid/download -> force download */
 router.get('/:uuid/download', async (req, res) => {
   const file = await File.findOne({ uuid: req.params.uuid });
   if (!file) return res.status(404).json({ message: 'Not found' });
 
   if (new Date() > file.expiryTime) {
-    // On expiry, tidy up
     try { if (fs.existsSync(file.filePath)) fs.unlinkSync(file.filePath); } catch {}
     await file.deleteOne();
     return res.status(410).json({ message: 'Link expired' });
@@ -115,4 +139,43 @@ router.get('/:uuid/download', async (req, res) => {
   res.download(file.filePath, file.originalName);
 });
 
+/** GET /api/files/user/:email -> list user uploads */
+router.get('/user/:email', async (req, res) => {
+  try {
+    const files = await File.find({ senderEmail: req.params.email }).sort({ createdAt: -1 });
+    res.json(files.map(f => ({
+      uuid: f.uuid,
+      originalName: f.originalName,
+      sizeBytes: f.sizeBytes,
+      mimeType: f.mimeType,
+      expiresAt: f.expiryTime,
+      createdAt: f.createdAt,
+      downloadCount: f.downloadCount,
+      expired: new Date() > f.expiryTime,
+    })));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to fetch user files' });
+  }
+});
+
+/** DELETE /api/files/:uuid -> delete file */
+router.delete('/:uuid', async (req, res) => {
+  try {
+    const file = await File.findOne({ uuid: req.params.uuid });
+    if (!file) return res.status(404).json({ message: 'File not found' });
+
+    try { if (fs.existsSync(file.filePath)) fs.unlinkSync(file.filePath); } catch (fsErr) {
+      console.error(" Error deleting physical file:", fsErr.message);
+    }
+
+    await file.deleteOne();
+    res.json({ message: ' File deleted successfully' });
+  } catch (err) {
+    console.error(" Error deleting file:", err);
+    res.status(500).json({ message: 'Server error deleting file' });
+  }
+});
+
 module.exports = router;
+
