@@ -140,40 +140,77 @@ router.get('/:uuid/download', async (req, res) => {
 });
 
 /** GET /api/files/user/:email -> list user uploads */
-router.get('/user/:email', async (req, res) => {
+//files which are uploaded
+router.get('/my-files/:email', async (req, res) => {
   try {
-    const files = await File.find({ senderEmail: req.params.email }).sort({ createdAt: -1 });
-    res.json(files.map(f => ({
-      uuid: f.uuid,
-      originalName: f.originalName,
-      sizeBytes: f.sizeBytes,
-      mimeType: f.mimeType,
-      expiresAt: f.expiryTime,
-      createdAt: f.createdAt,
-      downloadCount: f.downloadCount,
-      expired: new Date() > f.expiryTime,
-    })));
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: 'Failed to fetch user files' });
+    const files = await File.find({ senderEmail: req.params.email, isDeleted: false })
+      .sort({ createdAt: -1 });
+    res.json(files);
+  } catch {
+    res.status(500).json({ message: "Server error" });
   }
 });
 
-/** DELETE /api/files/:uuid -> delete file */
-router.delete('/:uuid', async (req, res) => {
+
+//recently deleted
+router.get('/deleted/:email', async (req, res) => {
+  try {
+    const files = await File.find({ senderEmail: req.params.email, isDeleted: true })
+      .sort({ deletedAt: -1 });
+    res.json(files);
+  } catch {
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+
+//files moved to recently deleted
+router.delete('/soft-delete/:uuid', async (req, res) => {
   try {
     const file = await File.findOne({ uuid: req.params.uuid });
     if (!file) return res.status(404).json({ message: 'File not found' });
 
-    try { if (fs.existsSync(file.filePath)) fs.unlinkSync(file.filePath); } catch (fsErr) {
-      console.error(" Error deleting physical file:", fsErr.message);
-    }
+    file.isDeleted = true;
+    file.deletedAt = new Date();
+    await file.save();
 
-    await file.deleteOne();
-    res.json({ message: ' File deleted successfully' });
-  } catch (err) {
-    console.error(" Error deleting file:", err);
+    res.json({ message: 'File moved to Recently Deleted', file });
+  } catch {
     res.status(500).json({ message: 'Server error deleting file' });
+  }
+});
+
+
+//to restore files
+router.patch('/restore/:uuid', async (req, res) => {
+  try {
+    const file = await File.findOne({ uuid: req.params.uuid, isDeleted: true });
+    if (!file) return res.status(404).json({ message: 'File not found or not deleted' });
+
+    file.isDeleted = false;
+    file.deletedAt = null;
+    await file.save();
+
+    res.json({ message: 'File restored successfully', file });
+  } catch {
+    res.status(500).json({ message: 'Server error restoring file' });
+  }
+});
+
+
+//to permanentely delete the file
+router.delete('/permanent/:uuid', async (req, res) => {
+  try {
+    const file = await File.findOne({ uuid: req.params.uuid, isDeleted: true });
+    if (!file) return res.status(404).json({ message: 'File not found or not deleted' });
+
+    if (fs.existsSync(file.filePath)) {
+      try { fs.unlinkSync(file.filePath); } catch (e) { console.error("Disk delete:", e.message); }
+    }
+    await file.deleteOne();
+    res.json({ message: 'File permanently deleted' });
+  } catch {
+    res.status(500).json({ message: 'Server error permanently deleting file' });
   }
 });
 

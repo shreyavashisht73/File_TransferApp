@@ -14,7 +14,10 @@ const fileSchema = new mongoose.Schema({
   senderEmail: { type: String },
   receiverEmail: { type: String },
 
-  downloadCount: { type: Number, default: 0 }
+  downloadCount: { type: Number, default: 0 },
+
+  isDeleted: { type: Boolean, default: false },
+  deletedAt: { type: Date, default: null },
 }, { timestamps: true });
 
 module.exports = mongoose.model('File', fileSchema);
